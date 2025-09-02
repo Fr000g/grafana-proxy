@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -171,18 +170,19 @@ func redirectLogin(response *http.Response) bool {
 }
 
 // newProxy creates the main http.Handler for the proxy.
-// It sets up an httputil.ReverseProxy and wraps it in a handler function
-// that implements the core logic of the proxy, including the session-retry mechanism.
+// It sets up an httputil.ReverseProxy and uses its ModifyResponse and
+// ErrorHandler hooks to implement a session-retry mechanism.
 //
-// The handler works as follows:
-//  1. It authenticates the proxy request via a token.
-//  2. It adds the Grafana session cookie to the request using addGrafanaSession.
-//  3. It forwards the request to Grafana using the ReverseProxy, capturing the response.
-//  4. If the response indicates an expired session (401 or redirect to login),
-//     it calls loadLogin to get a new session and retries the request.
-//  5. It finally streams the response from Grafana back to the original client.
+// The logic is as follows:
+//  1. An incoming request is authenticated and the cached Grafana session is attached.
+//  2. The request is proxied to Grafana.
+//  3. If Grafana's response indicates an expired session (e.g., 401 or redirect),
+//     ModifyResponse returns a special error.
+//  4. ErrorHandler catches this error, triggers a re-login via loadLogin, and
+//     retries the request once with the new session.
 //
-// This approach ensures that WebSocket connections are handled correctly by the ReverseProxy.
+// This approach avoids response buffering (i.e. httptest.ResponseRecorder),
+// ensuring that features like WebSockets that require connection hijacking work correctly.
 func newProxy(target *url.URL) http.Handler {
 	director := func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
@@ -192,21 +192,55 @@ func newProxy(target *url.URL) http.Handler {
 		req.Header.Set("Origin", cfg.BaseURL)
 	}
 
+	// We need to declare the proxy beforehand so we can use it in the error handler.
+	proxy := &httputil.ReverseProxy{
+		Director: director,
+	}
+
+	type retryKeyType struct{}
+	var retryKey retryKeyType
+
 	modifyResponse := func(resp *http.Response) error {
+		if redirectLogin(resp) {
+			// If we have already retried, don't do it again.
+			if resp.Request.Context().Value(retryKey) != nil {
+				log.Warn("Login retry failed, forwarding original response.")
+				return nil
+			}
+			// Return a custom error to trigger the ErrorHandler for a retry.
+			return errors.New("grafana-login-required")
+		}
 		resp.Header.Add("Access-Control-Allow-Credentials", "true")
 		return nil
 	}
 
 	errorHandler := func(rw http.ResponseWriter, req *http.Request, err error) {
+		requestLog := log.WithFields(log.Fields{
+			"request_id": requestIDFromContext(req.Context()),
+		})
+
+		if err.Error() == "grafana-login-required" {
+			requestLog.Info("Session expired or invalid, attempting to log in again.")
+
+			if loginErr := loadLogin(rw, req); loginErr != nil {
+				requestLog.WithError(loginErr).Error("Failed to re-login to Grafana")
+				http.Error(rw, "Failed to re-login to Grafana", http.StatusInternalServerError)
+				return
+			}
+
+			requestLog.Info("Re-issuing original request with new session.")
+			// Add a marker to the context to prevent infinite retry loops.
+			ctx := context.WithValue(req.Context(), retryKey, struct{}{})
+			proxy.ServeHTTP(rw, req.WithContext(ctx))
+			return
+		}
+
 		log.WithError(err).Error("Proxy error")
 		rw.WriteHeader(http.StatusBadGateway)
 	}
 
-	proxy := &httputil.ReverseProxy{
-		Director:       director,
-		ModifyResponse: modifyResponse,
-		ErrorHandler:   errorHandler,
-	}
+	proxy.ModifyResponse = modifyResponse
+	proxy.ErrorHandler = errorHandler
 
 	return http.HandlerFunc(func(res http.ResponseWriter, r *http.Request) {
 		requestID := uuid.New().String()
@@ -261,32 +295,7 @@ func newProxy(target *url.URL) http.Handler {
 
 		addGrafanaSession(res, r)
 
-		recorder := httptest.NewRecorder()
-		proxy.ServeHTTP(recorder, r)
-		result := recorder.Result()
-
-		if redirectLogin(result) {
-			requestLog.Info("Session expired or invalid, attempting to log in again.")
-			result.Body.Close()
-
-			if err := loadLogin(res, r); err != nil {
-				requestLog.WithError(err).Error("Failed to re-login to Grafana")
-				http.Error(res, "Failed to re-login to Grafana", http.StatusInternalServerError)
-				return
-			}
-
-			requestLog.Info("Re-issuing original request with new session.")
-			recorder2 := httptest.NewRecorder()
-			proxy.ServeHTTP(recorder2, r)
-			result = recorder2.Result()
-		}
-
-		defer result.Body.Close()
-		for k, v := range result.Header {
-			res.Header()[k] = v
-		}
-		res.WriteHeader(result.StatusCode)
-		io.Copy(res, result.Body)
+		proxy.ServeHTTP(res, r)
 	})
 }
 
