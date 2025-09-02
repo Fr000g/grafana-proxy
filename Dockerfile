@@ -1,21 +1,29 @@
-# 构建阶段
-FROM golang:alpine AS builder
+# Build stage
+FROM golang:1.24.5-alpine AS builder
 
-WORKDIR /app
+WORKDIR /go/src/github.com/Luzifer/grafana-proxy
+
+# Install build dependencies
+RUN set -ex \
+    && apk update && apk upgrade \
+    && apk add --update git
+
+# Copy source code and build
 COPY . .
+RUN set -ex \
+    && go mod tidy \
+    && go install -ldflags "-X main.version=$(git describe --tags || git rev-parse --short HEAD || echo dev)"
 
-RUN apk add --no-cache git && \
-    go build -ldflags "-X main.version=$(git describe --tags 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo dev)" -o grafana-proxy
+# Runtime stage - minimal alpine image
+FROM alpine:3.22.0
 
-# 运行阶段
-FROM alpine:latest
+# Install required runtime dependencies
+RUN apk add --no-cache ca-certificates
 
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
+# Copy only the binary from builder stage
+COPY --from=builder /go/bin/grafana-proxy /usr/local/bin/
 
-COPY --from=builder /app/grafana-proxy .
+EXPOSE 3001
 
-EXPOSE 3000
-
-ENTRYPOINT ["./grafana-proxy"]
-CMD ["--listen", "0.0.0.0:3000"]
+ENTRYPOINT ["/usr/local/bin/grafana-proxy"]
+CMD ["--listen", "0.0.0.0:3001"]
