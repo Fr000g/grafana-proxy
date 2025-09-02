@@ -6,7 +6,7 @@ replace github.com/onsi/gomega v1.18.1 => github.com/onsi/gomega v1.32.0
 
 require (
 	github.com/Luzifer/rconfig v1.2.0
-	github.com/satori/go.uuid v1.1.0
+	github.com/google/uuid v1.6.0
 	github.com/sirupsen/logrus v1.0.3
 )
 
