@@ -235,6 +235,11 @@ func newProxy(target *url.URL) http.Handler {
 			return
 		}
 
+		// Don't log context canceled errors
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+
 		log.WithError(err).Error("Proxy error")
 		rw.WriteHeader(http.StatusBadGateway)
 	}
