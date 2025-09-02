@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -63,8 +65,9 @@ func init() {
 		os.Exit(1)
 	}
 	if cfg.Token == "" {
-		cfg.Token = uuid.New().String()
-		log.Info("No token was specified, a random token was generated: ", cfg.Token)
+		w := md5.New()
+		io.WriteString(w, cfg.Pass)
+		cfg.Token = fmt.Sprintf("%x", w.Sum(nil))
 	}
 	log.Infof("grafana proxy config: %+v", cfg)
 }
