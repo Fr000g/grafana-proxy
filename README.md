@@ -46,3 +46,64 @@ If you want to run the `grafana-proxy` on a public accessible host but do not wa
 ```
 
 Your users now need to use `http://<ip>:3000/mydashboard?token=mysharedsecret` to access the dashboard.
+
+## Multi-Architecture Docker Builds
+
+This project includes a Makefile that supports building Docker images for multiple architectures (amd64 and arm64).
+
+### Prerequisites
+
+- Docker with buildx support
+- Make
+
+### Available Make Targets
+
+```bash
+# Show all available targets
+make help
+
+# Build images for specific architectures
+make build-amd64          # Build for amd64
+make build-arm64          # Build for arm64
+make build                # Build for both architectures
+
+# Build multi-platform image
+make build-multi          # Build universal multi-platform image
+
+# Push to registry (requires REGISTRY variable)
+make push-amd64 REGISTRY=your-registry.com/username
+make push-arm64 REGISTRY=your-registry.com/username
+make push REGISTRY=your-registry.com/username        # Push both
+make push-multi REGISTRY=your-registry.com/username  # Push multi-platform
+
+# Development and testing
+make test-build           # Test build without pushing
+make dev-run              # Run development container
+make clean               # Clean up images and binaries
+```
+
+### Examples
+
+```bash
+# Build for both architectures locally
+make build
+
+# Build and push to Docker Hub
+make push-multi REGISTRY=yourusername
+
+# Build specific architecture
+make build-amd64
+
+# Test build for all platforms
+make test-build
+
+# Show built image sizes
+make image-sizes
+```
+
+### Image Tags
+
+The built images will have the following tags:
+- `grafana-proxy:latest-amd64` / `grafana-proxy:v1.0.0-amd64`
+- `grafana-proxy:latest-arm64` / `grafana-proxy:v1.0.0-arm64`
+- `grafana-proxy:latest` / `grafana-proxy:v1.0.0` (multi-platform)
