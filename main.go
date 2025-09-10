@@ -1,22 +1,23 @@
 package main
 
 import (
-	"context"
-	"crypto/md5"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"os"
-	"strings"
-	"sync"
+    "bytes"
+    "context"
+    "crypto/md5"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "io"
+    "net/http"
+    "net/http/httputil"
+    "net/url"
+    "os"
+    "strings"
+    "sync"
 
-	"github.com/Luzifer/rconfig"
-	"github.com/google/uuid"
-	log "github.com/sirupsen/logrus"
+    "github.com/Luzifer/rconfig"
+    "github.com/google/uuid"
+    log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -80,6 +81,18 @@ func removeGrafanaSession(header *http.Header) {
 			header.Add("Cookie", h)
 		}
 	}
+}
+
+// resetProxyAuthCookie clears the grafana-proxy-auth cookie on the client
+func resetProxyAuthCookie(res http.ResponseWriter) {
+    http.SetCookie(res, &http.Cookie{
+        Name:     "grafana-proxy-auth",
+        Value:    "",
+        Path:     "/",
+        MaxAge:   -1,
+        HttpOnly: true,
+        Secure:   true,
+    })
 }
 
 // addGrafanaSession ensures that the request has a valid Grafana session cookie.
@@ -193,47 +206,74 @@ func newProxy(target *url.URL) http.Handler {
 	}
 
 	// We need to declare the proxy beforehand so we can use it in the error handler.
-	proxy := &httputil.ReverseProxy{
-		Director: director,
-	}
+    proxy := &httputil.ReverseProxy{
+        Director: director,
+    }
 
-	type retryKeyType struct{}
-	var retryKey retryKeyType
+    // context keys for request-scoped data
+    type retryKeyType struct{}
+    var retryKey retryKeyType
+    type ctxTokenAuthKey struct{}
+    type ctxLogoutKey struct{}
+    type ctxBodyKey struct{}
 
-	modifyResponse := func(resp *http.Response) error {
-		if redirectLogin(resp) {
-			// If we have already retried, don't do it again.
-			if resp.Request.Context().Value(retryKey) != nil {
-				log.Warn("Login retry failed, forwarding original response.")
-				return nil
-			}
-			// Return a custom error to trigger the ErrorHandler for a retry.
-			return errors.New("grafana-login-required")
-		}
-		resp.Header.Add("Access-Control-Allow-Credentials", "true")
-		return nil
-	}
+    modifyResponse := func(resp *http.Response) error {
+        // Always allow credentials for browser requests
+        resp.Header.Add("Access-Control-Allow-Credentials", "true")
 
-	errorHandler := func(rw http.ResponseWriter, req *http.Request, err error) {
-		requestLog := log.WithFields(log.Fields{
-			"request_id": requestIDFromContext(req.Context()),
-		})
+        // Only handle auth redirects when this request was token-authorized
+        tokenAuthorized, _ := resp.Request.Context().Value(ctxTokenAuthKey{}).(bool)
+        isLogout, _ := resp.Request.Context().Value(ctxLogoutKey{}).(bool)
+        if !tokenAuthorized {
+            return nil
+        }
 
-		if err.Error() == "grafana-login-required" {
-			requestLog.Info("Session expired or invalid, attempting to log in again.")
+        if redirectLogin(resp) {
+            // Invalidate cached session on any login redirect
+            sessionCache.Lock()
+            sessionCache.session = ""
+            sessionCache.Unlock()
 
-			if loginErr := loadLogin(rw, req); loginErr != nil {
-				requestLog.WithError(loginErr).Error("Failed to re-login to Grafana")
-				http.Error(rw, "Failed to re-login to Grafana", http.StatusInternalServerError)
-				return
-			}
+            // Do not auto-relogin on explicit logout
+            if isLogout {
+                return nil
+            }
 
-			requestLog.Info("Re-issuing original request with new session.")
-			// Add a marker to the context to prevent infinite retry loops.
-			ctx := context.WithValue(req.Context(), retryKey, struct{}{})
-			proxy.ServeHTTP(rw, req.WithContext(ctx))
-			return
-		}
+            // If we have already retried, don't do it again.
+            if resp.Request.Context().Value(retryKey) != nil {
+                log.Warn("Login retry failed, forwarding original response.")
+                return nil
+            }
+            // Return a custom error to trigger the ErrorHandler for a retry.
+            return errors.New("grafana-login-required")
+        }
+        return nil
+    }
+
+    errorHandler := func(rw http.ResponseWriter, req *http.Request, err error) {
+        requestLog := log.WithFields(log.Fields{
+            "request_id": requestIDFromContext(req.Context()),
+        })
+
+        if err.Error() == "grafana-login-required" {
+            requestLog.Info("Session expired or invalid, attempting to log in again.")
+
+            if loginErr := loadLogin(rw, req); loginErr != nil {
+                requestLog.WithError(loginErr).Error("Failed to re-login to Grafana")
+                http.Error(rw, "Failed to re-login to Grafana", http.StatusInternalServerError)
+                return
+            }
+
+            requestLog.Info("Re-issuing original request with new session.")
+            // Reset body for retry if we buffered it
+            if bodyBytes, ok := req.Context().Value(ctxBodyKey{}).([]byte); ok {
+                req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+            }
+            // Add a marker to the context to prevent infinite retry loops.
+            ctx := context.WithValue(req.Context(), retryKey, struct{}{})
+            proxy.ServeHTTP(rw, req.WithContext(ctx))
+            return
+        }
 
 		// Don't log context canceled errors
 		if errors.Is(err, context.Canceled) {
@@ -247,61 +287,94 @@ func newProxy(target *url.URL) http.Handler {
 	proxy.ModifyResponse = modifyResponse
 	proxy.ErrorHandler = errorHandler
 
-	return http.HandlerFunc(func(res http.ResponseWriter, r *http.Request) {
-		requestID := uuid.New().String()
-		ctx := context.WithValue(r.Context(), RequestIDKey, requestID)
-		r = r.WithContext(ctx)
+    return http.HandlerFunc(func(res http.ResponseWriter, r *http.Request) {
+        requestID := uuid.New().String()
+        ctx := context.WithValue(r.Context(), RequestIDKey, requestID)
+        r = r.WithContext(ctx)
 
-		requestLog := log.WithFields(log.Fields{
-			"http_user_agent": r.Header.Get("User-Agent"),
-			"host":            r.Host,
-			"remote_addr":     r.Header.Get("X-Forwarded-For"),
-			"request":         r.URL.Path,
-			"request_full":    r.URL.String(),
-			"request_method":  r.Method,
-			"request_id":      requestIDFromContext(ctx),
-			"referer":         r.Referer(),
-		})
+        requestLog := log.WithFields(log.Fields{
+            "http_user_agent": r.Header.Get("User-Agent"),
+            "host":            r.Host,
+            "remote_addr":     r.Header.Get("X-Forwarded-For"),
+            "request":         r.URL.Path,
+            "request_full":    r.URL.String(),
+            "request_method":  r.Method,
+            "request_id":      requestIDFromContext(ctx),
+            "referer":         r.Referer(),
+        })
 
-		referer, _ := url.Parse(r.Referer())
-		suppliedToken := ""
-		if authCookie, err := r.Cookie("grafana-proxy-auth"); err == nil {
-			suppliedToken = authCookie.Value
-		}
-		if suppliedToken == "" && referer.Query().Get("token") != "" {
-			suppliedToken = referer.Query().Get("token")
-		}
-		if token := r.URL.Query().Get("token"); token != "" {
-			suppliedToken = token
-		}
+        referer, _ := url.Parse(r.Referer())
+        suppliedToken := ""
+        if authCookie, err := r.Cookie("grafana-proxy-auth"); err == nil {
+            suppliedToken = authCookie.Value
+        }
+        if suppliedToken == "" && referer.Query().Get("token") != "" {
+            suppliedToken = referer.Query().Get("token")
+        }
+        if token := r.URL.Query().Get("token"); token != "" {
+            suppliedToken = token
+        }
 
-		if suppliedToken == "" {
-			requestLog.Debug("No token supplied, proxying without login")
-			proxy.ServeHTTP(res, r)
-			return
-		}
+        // Determine if this request is token-authorized
+        tokenAuthorized := false
+        if suppliedToken != "" && suppliedToken == cfg.Token {
+            tokenAuthorized = true
+        }
 
-		if suppliedToken != cfg.Token {
-			requestLog.Errorf("Token authorized error, token=%s, cfgToken=%s", suppliedToken, cfg.Token)
-			http.Error(res, "Token authorized error", http.StatusForbidden)
-			return
-		}
+        // Mark token auth state in context for downstream handlers
+        ctx = context.WithValue(r.Context(), ctxTokenAuthKey{}, tokenAuthorized)
+        r = r.WithContext(ctx)
 
-		if r.URL.Query().Get("token") != "" {
-			http.SetCookie(res, &http.Cookie{
-				Name:     "grafana-proxy-auth",
-				Value:    r.URL.Query().Get("token"),
-				MaxAge:   31536000, // 1 Year
-				Path:     "/",
-				HttpOnly: true,
-				Secure:   true,
-			})
-		}
+        // Special handling for explicit logout: clear proxy auth + cached session
+        isLogout := strings.HasPrefix(r.URL.Path, "/logout")
+        if isLogout {
+            // Clear our cached session and forward as-is
+            sessionCache.Lock()
+            sessionCache.session = ""
+            sessionCache.Unlock()
+            resetProxyAuthCookie(res)
+            removeGrafanaSession(&r.Header)
+            // Mark in context so ModifyResponse won't re-login
+            r = r.WithContext(context.WithValue(r.Context(), ctxLogoutKey{}, true))
+        }
 
-		addGrafanaSession(res, r)
+        // If token is supplied but invalid, reject early
+        if suppliedToken != "" && !tokenAuthorized {
+            requestLog.Errorf("Token authorized error, token=%s, cfgToken=%s", suppliedToken, cfg.Token)
+            http.Error(res, "Token authorized error", http.StatusForbidden)
+            return
+        }
 
-		proxy.ServeHTTP(res, r)
-	})
+        // If token is present and valid, set sticky auth cookie and ensure grafana session
+        if tokenAuthorized {
+            if r.URL.Query().Get("token") != "" {
+                http.SetCookie(res, &http.Cookie{
+                    Name:     "grafana-proxy-auth",
+                    Value:    r.URL.Query().Get("token"),
+                    MaxAge:   31536000, // 1 Year
+                    Path:     "/",
+                    HttpOnly: true,
+                    Secure:   true,
+                })
+            }
+            addGrafanaSession(res, r)
+        } else {
+            requestLog.Debug("No valid token supplied, proxying without auto-login")
+        }
+
+        // Buffer request body for potential retry (e.g., after re-login)
+        if r.Body != nil && r.Body != http.NoBody {
+            // Only buffer once; if already buffered, skip
+            if _, ok := r.Context().Value(ctxBodyKey{}).([]byte); !ok {
+                bodyBytes, _ := io.ReadAll(r.Body)
+                r.Body.Close()
+                r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+                r = r.WithContext(context.WithValue(r.Context(), ctxBodyKey{}, bodyBytes))
+            }
+        }
+
+        proxy.ServeHTTP(res, r)
+    })
 }
 
 func requestIDFromContext(ctx context.Context) string {
